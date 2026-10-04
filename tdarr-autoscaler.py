@@ -27,7 +27,7 @@ Run manually (or cronjob):
 
 import datetime as _dt
 import json as _json
-from typing import List
+from typing import List, Tuple
 
 import requests
 
@@ -55,6 +55,10 @@ WORKERS_IDLE = 1          # No one watching (daytime)
 WORKERS_ACTIVE = 0        # Someone is streaming
 WORKERS_NIGHT = 1         # No one watching (night)
 WORKERS_NIGHT_ACTIVE = 0  # Streaming during night
+
+# Treat a target of 0 as a graceful drain: pause the node without reducing its
+# worker limit, so the current job can finish and no new job is picked up.
+PAUSE_NODE_WHEN_TARGET_ZERO = True
 
 # Night mode hours (24h format)
 NIGHT_START = 0   # Midnight
@@ -105,11 +109,16 @@ def _worker_types_from_friendly(name: str) -> List[str]:
     _error_exit("Invalid WORKER_TYPE. Use 'GPU', 'CPU', or 'BOTH'")
 
 
-def _get_first_node_id(tdarr_url: str) -> str:
+def _get_first_node(tdarr_url: str) -> Tuple[str, dict]:
     nodes = _get_json(f"{tdarr_url}/api/v2/get-nodes")
     if not isinstance(nodes, dict) or not nodes:
-        return ""
-    return next(iter(nodes.keys()), "")
+        return "", {}
+
+    node_id = next(iter(nodes.keys()), "")
+    node = nodes.get(node_id, {})
+    if not isinstance(node, dict):
+        node = {}
+    return node_id, node
 
 
 def _is_night(hour: int, night_start: int, night_end: int) -> bool:
@@ -157,10 +166,9 @@ def _get_transcodes_tautulli (tautulli_url: str, api_key: str) -> int:
         if isinstance(s, dict) and s.get("video_decision") == "transcode"
     )
 
-def _get_current_worker_limit(tdarr_url: str, node_id: str, worker_type: str) -> int:
-    nodes = _get_json(f"{tdarr_url}/api/v2/get-nodes")
+def _get_current_worker_limit(node: dict, worker_type: str) -> int:
     try:
-        val = nodes[node_id]["workerLimits"][worker_type]
+        val = node["workerLimits"][worker_type]
     except Exception:
         val = 0
 
@@ -177,10 +185,26 @@ def _alter_worker_limit(tdarr_url: str, node_id: str, worker_type: str, process:
     _post_json(f"{tdarr_url}/api/v2/alter-worker-limit", payload)
 
 
+def _set_node_paused(tdarr_url: str, node_id: str, paused: bool) -> None:
+    payload = {
+        "data": {
+            "nodeID": node_id,
+            "nodeUpdates": {"nodePaused": paused},
+        }
+    }
+    _post_json(f"{tdarr_url}/api/v2/update-node", payload)
+
+
+def _worker_type_label(worker_type: str) -> str:
+    if worker_type == "transcodegpu":
+        return "GPU Workers"
+    return "CPU Workers"
+
+
 def main() -> None:
     worker_types = _worker_types_from_friendly(WORKER_TYPE)
 
-    node_id = _get_first_node_id(TDARR_URL)
+    node_id, node = _get_first_node(TDARR_URL)
     if not node_id or node_id == "null":
         _error_exit("Could not get Tdarr node ID")
 
@@ -214,14 +238,26 @@ def main() -> None:
         else:
             target_workers = WORKERS_ACTIVE
 
-    output = ""
-    for tdarr_worker_type in worker_types:
-        if tdarr_worker_type == "transcodegpu":
-            type_label = "GPU Workers"
-        else:
-            type_label = "CPU Workers"
+    node_paused = node.get("nodePaused") is True
+    output_parts = []
 
-        current = _get_current_worker_limit(TDARR_URL, node_id, tdarr_worker_type)
+    if target_workers == 0 and PAUSE_NODE_WHEN_TARGET_ZERO:
+        if not node_paused:
+            _set_node_paused(TDARR_URL, node_id, True)
+
+        output_parts.append("Node: paused (graceful drain)")
+        for tdarr_worker_type in worker_types:
+            type_label = _worker_type_label(tdarr_worker_type)
+            current = _get_current_worker_limit(node, tdarr_worker_type)
+            output_parts.append(f"{type_label}: {current} (preserved)")
+
+        output = " | ".join(output_parts)
+        print(f"[{_now_stamp()}] {stream_type}: {streams} | Mode: {time_mode} | {output}")
+        return
+
+    for tdarr_worker_type in worker_types:
+        type_label = _worker_type_label(tdarr_worker_type)
+        current = _get_current_worker_limit(node, tdarr_worker_type)
 
         if current != target_workers:
             original = current
@@ -235,11 +271,18 @@ def main() -> None:
                     _alter_worker_limit(TDARR_URL, node_id, tdarr_worker_type, "decrease")
                     current -= 1
                 diff = f"-{original - target_workers}"
-            output += f" | {type_label}: {target_workers} ({diff})"
+            output_parts.append(f"{type_label}: {target_workers} ({diff})")
         else:
-            output += f" | {type_label}: {target_workers} (no change)"
+            output_parts.append(f"{type_label}: {target_workers} (no change)")
 
-    print(f"[{_now_stamp()}] {stream_type}: {streams} | Mode: {time_mode}{output}")
+    # Worker limits are prepared while the node is still paused. Unpause last so
+    # Tdarr cannot claim a new item with stale limits during this invocation.
+    if node_paused:
+        _set_node_paused(TDARR_URL, node_id, False)
+        output_parts.append("Node: unpaused")
+
+    output = " | ".join(output_parts)
+    print(f"[{_now_stamp()}] {stream_type}: {streams} | Mode: {time_mode} | {output}")
 
 
 if __name__ == "__main__":

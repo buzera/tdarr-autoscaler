@@ -22,6 +22,8 @@ It can:
 -   Detect active playback sessions
 -   Optionally count only active transcodes (ignores Direct Play /
     Direct Stream)
+-   Gracefully drain a node when the configured worker target is zero,
+    allowing the current job to finish without accepting a new one
 -   Apply different worker limits for:
     -   Idle (day)
     -   Active streaming (day)
@@ -72,6 +74,9 @@ WORKERS_ACTIVE = 0        # Someone is streaming
 WORKERS_NIGHT = 1         # No one watching (night)
 WORKERS_NIGHT_ACTIVE = 0  # Streaming during night
 
+# Pause/drain the node instead of reducing a worker limit to zero
+PAUSE_NODE_WHEN_TARGET_ZERO = True
+
 # Night mode hours (24h format)
 NIGHT_START = 0   # Midnight
 NIGHT_END = 5     # 5 AM
@@ -79,6 +84,15 @@ NIGHT_END = 5     # 5 AM
 
 Adjust worker values according to your hardware capacity and desired
 behavior.
+
+With `PAUSE_NODE_WHEN_TARGET_ZERO = True`, any selected target of `0`
+pauses the Tdarr node through `/api/v2/update-node` and preserves the
+current worker limits. An active job can finish, but the paused node does
+not take another job. When the selected target becomes positive again,
+the script restores the configured worker limit and unpauses the node.
+
+Set this option to `False` to retain the original behavior, where a target
+of `0` is applied directly by decreasing the worker limit.
 
 ------------------------------------------------------------------------
 
@@ -134,8 +148,21 @@ Example (runs every 5 minutes):
 1.  Queries Tautulli API for current activity
 2.  Counts all sessions or only transcoding sessions (if enabled)
 3.  Detects whether current time is within configured night window
-4.  Sets Tdarr worker limits via Tdarr API
-5.  Logs actions with timestamps
+4.  Pauses the node for a zero target, or applies positive worker limits
+5.  Unpauses the node when work can resume
+6.  Logs actions with timestamps
+
+Example while Plex is transcoding:
+
+``` text
+Transcodes: 1 | Mode: Day | Node: paused (graceful drain) | GPU Workers: 1 (preserved)
+```
+
+Example after the last Plex transcode ends:
+
+``` text
+Transcodes: 0 | Mode: Day | GPU Workers: 1 (no change) | Node: unpaused
+```
 
 ------------------------------------------------------------------------
 
@@ -152,4 +179,3 @@ Example (runs every 5 minutes):
 ## License
 
 MIT
-
